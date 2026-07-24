@@ -1,3 +1,4 @@
+#include <stdbool.h>
 #include <stdint.h>
 
 #include <driver/gpio.h>
@@ -5,7 +6,10 @@
 #include <esp_err.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
+#include <nvs.h>
+#include <nvs_flash.h>
 
 #include "esp32-ism330dlc.h"
 #include "esp32-esc-xw30a.h"
@@ -18,10 +22,107 @@
 #define IMU_I2C_ADDRESS    0x6AU
 #define IMU_LOG_INTERVAL   256U
 #define IMU_YIELD_INTERVAL 256U
+#define IMU_NVS_NAMESPACE  "flight_imu"
+#define IMU_NVS_CONFIG_KEY "config"
+#define IMU_CONFIG_VERSION 1U
 
 static const char *APP_TAG = "flight-controller";
 static portMUX_TYPE s_telemetry_lock = portMUX_INITIALIZER_UNLOCKED;
 static esp32_wifi_drone_remote_telemetry_t s_telemetry;
+static SemaphoreHandle_t s_imu_mutex;
+static esp32_ism330dlc_t s_imu;
+
+/** @brief Versioned representation of the ISM330 settings stored in NVS. */
+typedef struct {
+    uint8_t version;
+    uint8_t accelerometer_odr;
+    uint8_t gyroscope_odr;
+    uint8_t accelerometer_full_scale;
+    uint8_t gyroscope_full_scale;
+} imu_persistent_config_t;
+
+/** @brief Return whether a persisted ISM330 configuration is supported. */
+static bool is_valid_persistent_imu_config(
+    const imu_persistent_config_t *config)
+{
+    return config != NULL &&
+           config->version == IMU_CONFIG_VERSION &&
+           config->accelerometer_odr <= ISM330DLC_ODR_6660_HZ &&
+           config->gyroscope_odr <= ISM330DLC_ODR_6660_HZ &&
+           config->accelerometer_full_scale <= ISM330DLC_ACCEL_FS_8G &&
+           config->gyroscope_full_scale <= ISM330DLC_GYRO_FS_2000_DPS;
+}
+
+/** @brief Save the active ISM330 configuration to non-volatile storage. */
+static esp_err_t save_imu_config(const esp32_ism330dlc_t *imu)
+{
+    if (imu == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const imu_persistent_config_t stored = {
+        .version = IMU_CONFIG_VERSION,
+        .accelerometer_odr = imu->accel_odr,
+        .gyroscope_odr = imu->gyro_odr,
+        .accelerometer_full_scale = imu->accel_full_scale,
+        .gyroscope_full_scale = imu->gyro_full_scale,
+    };
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(IMU_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_blob(nvs, IMU_NVS_CONFIG_KEY, &stored, sizeof(stored));
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return err;
+}
+
+/**
+ * @brief Load persisted settings into an ISM330 instance.
+ *
+ * Missing, obsolete, or invalid data leaves the driver's defaults unchanged.
+ */
+static esp_err_t load_imu_config(esp32_ism330dlc_t *imu)
+{
+    if (imu == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(IMU_NVS_NAMESPACE, NVS_READONLY, &nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    imu_persistent_config_t stored = {0};
+    size_t stored_size = sizeof(stored);
+    err = nvs_get_blob(nvs, IMU_NVS_CONFIG_KEY, &stored, &stored_size);
+    nvs_close(nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (stored_size != sizeof(stored) ||
+        !is_valid_persistent_imu_config(&stored)) {
+        ESP_LOGW(APP_TAG, "Ignoring invalid persisted ISM330 configuration");
+        return ESP_OK;
+    }
+
+    imu->accel_odr = stored.accelerometer_odr;
+    imu->gyro_odr = stored.gyroscope_odr;
+    imu->accel_full_scale = stored.accelerometer_full_scale;
+    imu->gyro_full_scale = stored.gyroscope_full_scale;
+    ESP_LOGI(APP_TAG, "Restored persisted ISM330 configuration");
+    return ESP_OK;
+}
 
 /**
  * @brief Copy the latest IMU sample into a webserver telemetry response.
@@ -39,6 +140,69 @@ static esp_err_t provide_remote_telemetry(
     *telemetry = s_telemetry;
     portEXIT_CRITICAL(&s_telemetry_lock);
     return ESP_OK;
+}
+
+/** @brief Return the active ISM330DLC acquisition settings. */
+static esp_err_t get_remote_imu_config(
+    esp32_wifi_drone_remote_imu_config_t *config,
+    void *context)
+{
+    esp32_ism330dlc_t *imu = context;
+    if (config == NULL || imu == NULL || s_imu_mutex == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(s_imu_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    *config = (esp32_wifi_drone_remote_imu_config_t) {
+        .accelerometer_odr = imu->accel_odr,
+        .gyroscope_odr = imu->gyro_odr,
+        .accelerometer_full_scale = imu->accel_full_scale,
+        .gyroscope_full_scale = imu->gyro_full_scale,
+    };
+    xSemaphoreGive(s_imu_mutex);
+    return ESP_OK;
+}
+
+/** @brief Apply web-submitted acquisition settings to the ISM330DLC. */
+static esp_err_t set_remote_imu_config(
+    const esp32_wifi_drone_remote_imu_config_t *config,
+    void *context)
+{
+    esp32_ism330dlc_t *imu = context;
+    if (config == NULL || imu == NULL || s_imu_mutex == NULL ||
+        config->accelerometer_odr > ISM330DLC_ODR_6660_HZ ||
+        config->gyroscope_odr > ISM330DLC_ODR_6660_HZ ||
+        config->accelerometer_full_scale > ISM330DLC_ACCEL_FS_8G ||
+        config->gyroscope_full_scale > ISM330DLC_GYRO_FS_2000_DPS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(s_imu_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp32_ism330dlc_odr_t old_accel_odr = imu->accel_odr;
+    esp32_ism330dlc_odr_t old_gyro_odr = imu->gyro_odr;
+    esp32_ism330dlc_accel_fs_t old_accel_scale = imu->accel_full_scale;
+    esp32_ism330dlc_gyro_fs_t old_gyro_scale = imu->gyro_full_scale;
+    imu->accel_odr = config->accelerometer_odr;
+    imu->gyro_odr = config->gyroscope_odr;
+    imu->accel_full_scale = config->accelerometer_full_scale;
+    imu->gyro_full_scale = config->gyroscope_full_scale;
+
+    esp_err_t err = esp32_ism330dlc_init(imu);
+    if (err == ESP_OK) {
+        err = save_imu_config(imu);
+    }
+    if (err != ESP_OK) {
+        imu->accel_odr = old_accel_odr;
+        imu->gyro_odr = old_gyro_odr;
+        imu->accel_full_scale = old_accel_scale;
+        imu->gyro_full_scale = old_gyro_scale;
+        esp32_ism330dlc_init(imu);
+    }
+    xSemaphoreGive(s_imu_mutex);
+    return err;
 }
 
 static esp_err_t initialize_imu(esp32_ism330dlc_t *imu)
@@ -76,31 +240,49 @@ static esp_err_t initialize_imu(esp32_ism330dlc_t *imu)
     *imu = (esp32_ism330dlc_t)ESP32_ISM330DLC_DEFAULT_CONFIG(
         esp32_ism330dlc_i2c_read, esp32_ism330dlc_i2c_write, device);
 
-    /* Select the highest output rates and widest measurement ranges. */
-    imu->accel_odr = ISM330DLC_ODR_6660_HZ;
-    imu->gyro_odr = ISM330DLC_ODR_6660_HZ;
-    imu->accel_full_scale = ISM330DLC_ACCEL_FS_16G;
-    imu->gyro_full_scale = ISM330DLC_GYRO_FS_2000_DPS;
-
+    err = load_imu_config(imu);
+    if (err != ESP_OK) {
+        ESP_LOGW(APP_TAG, "Failed to load persisted ISM330 configuration: %s",
+                 esp_err_to_name(err));
+    }
     return esp32_ism330dlc_init(imu);
 }
 
 void app_main(void)
 {
-    esp32_wifi_drone_remote_config_t remote_config =
-        ESP32_WIFI_DRONE_REMOTE_DEFAULT_CONFIG();
-    remote_config.telemetry_handler = provide_remote_telemetry;
-    esp_err_t err = esp32_wifi_drone_remote_start(&remote_config);
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
     if (err != ESP_OK) {
-        ESP_LOGE(APP_TAG, "Wi-Fi drone remote initialization failed: %s",
+        ESP_LOGE(APP_TAG, "NVS initialization failed: %s",
                  esp_err_to_name(err));
         return;
     }
 
-    esp32_ism330dlc_t imu;
-    err = initialize_imu(&imu);
+    s_imu_mutex = xSemaphoreCreateMutex();
+    if (s_imu_mutex == NULL) {
+        ESP_LOGE(APP_TAG, "Failed to create IMU mutex");
+        return;
+    }
+    err = initialize_imu(&s_imu);
     if (err != ESP_OK) {
         ESP_LOGE(APP_TAG, "ISM330DLC initialization failed: %s",
+                 esp_err_to_name(err));
+        return;
+    }
+
+    esp32_wifi_drone_remote_config_t remote_config =
+        ESP32_WIFI_DRONE_REMOTE_DEFAULT_CONFIG();
+    remote_config.telemetry_handler = provide_remote_telemetry;
+    remote_config.imu_get_handler = get_remote_imu_config;
+    remote_config.imu_set_handler = set_remote_imu_config;
+    remote_config.imu_context = &s_imu;
+    err = esp32_wifi_drone_remote_start(&remote_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "Wi-Fi drone remote initialization failed: %s",
                  esp_err_to_name(err));
         return;
     }
@@ -110,7 +292,11 @@ void app_main(void)
     while (true) {
         esp32_ism330dlc_sample_t sample;
 
-        err = esp32_ism330dlc_read(&imu, &sample);
+        if (xSemaphoreTake(s_imu_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+            continue;
+        }
+        err = esp32_ism330dlc_read(&s_imu, &sample);
+        xSemaphoreGive(s_imu_mutex);
         if (err == ESP_OK) {
             portENTER_CRITICAL(&s_telemetry_lock);
             s_telemetry = (esp32_wifi_drone_remote_telemetry_t) {
@@ -123,23 +309,6 @@ void app_main(void)
             };
             portEXIT_CRITICAL(&s_telemetry_lock);
             ++sample_count;
-
-            /* UART logging is much slower than acquisition, so only print a
-             * periodic sample while reading the sensor continuously. */
-            if ((sample_count % IMU_LOG_INTERVAL) == 0U) {
-                printf(
-                    "\raccel [g]: %.3f, %.3f, %.3f | "
-                    "gyro [dps]: %.3f, %.3f, %.3f | temp: %.2f C",
-                    sample.acceleration_g.x,
-                    sample.acceleration_g.y,
-                    sample.acceleration_g.z,
-                    sample.angular_rate_dps.x,
-                    sample.angular_rate_dps.y,
-                    sample.angular_rate_dps.z,
-                    sample.temperature_c
-                );
-                fflush(stdout);
-            }
         } else {
             ESP_LOGE(APP_TAG, "Failed to read ISM330DLC: %s",
                      esp_err_to_name(err));

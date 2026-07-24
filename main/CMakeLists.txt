@@ -4,4 +4,5 @@ idf_component_register(SRCS "main.c"
                                   esp32-esc-xw30a
                                   esp32-wifi-drone-remote
                                   esp_driver_gpio
-                                  esp_driver_i2c)
+                                  esp_driver_i2c
+                                  nvs_flash)
