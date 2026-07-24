@@ -1,3 +1,5 @@
+#include <stdint.h>
+
 #include <driver/gpio.h>
 #include <driver/i2c_master.h>
 #include <esp_err.h>
@@ -12,7 +14,8 @@
 #define IMU_I2C_SCL_GPIO   GPIO_NUM_9
 #define IMU_I2C_FREQUENCY  400000U
 #define IMU_I2C_ADDRESS    0x6AU
-#define IMU_SAMPLE_PERIOD  pdMS_TO_TICKS(1000U)
+#define IMU_LOG_INTERVAL   256U
+#define IMU_YIELD_INTERVAL 256U
 
 static const char *APP_TAG = "flight-controller";
 
@@ -51,6 +54,12 @@ static esp_err_t initialize_imu(esp32_ism330dlc_t *imu)
     *imu = (esp32_ism330dlc_t)ESP32_ISM330DLC_DEFAULT_CONFIG(
         esp32_ism330dlc_i2c_read, esp32_ism330dlc_i2c_write, device);
 
+    /* Select the highest output rates and widest measurement ranges. */
+    imu->accel_odr = ISM330DLC_ODR_6660_HZ;
+    imu->gyro_odr = ISM330DLC_ODR_6660_HZ;
+    imu->accel_full_scale = ISM330DLC_ACCEL_FS_16G;
+    imu->gyro_full_scale = ISM330DLC_GYRO_FS_2000_DPS;
+
     return esp32_ism330dlc_init(imu);
 }
 
@@ -64,26 +73,38 @@ void app_main(void)
         return;
     }
 
+    uint32_t sample_count = 0;
+
     while (true) {
         esp32_ism330dlc_sample_t sample;
 
         err = esp32_ism330dlc_read(&imu, &sample);
         if (err == ESP_OK) {
-            ESP_LOGI(APP_TAG,
-                     "accel [g]: %.3f, %.3f, %.3f | "
-                     "gyro [dps]: %.3f, %.3f, %.3f | temp: %.2f C",
-                     sample.acceleration_g.x,
-                     sample.acceleration_g.y,
-                     sample.acceleration_g.z,
-                     sample.angular_rate_dps.x,
-                     sample.angular_rate_dps.y,
-                     sample.angular_rate_dps.z,
-                     sample.temperature_c);
+            ++sample_count;
+
+            /* UART logging is much slower than acquisition, so only print a
+             * periodic sample while reading the sensor continuously. */
+            if ((sample_count % IMU_LOG_INTERVAL) == 0U) {
+                ESP_LOGI(APP_TAG,
+                         "accel [g]: %.3f, %.3f, %.3f | "
+                         "gyro [dps]: %.3f, %.3f, %.3f | temp: %.2f C",
+                         sample.acceleration_g.x,
+                         sample.acceleration_g.y,
+                         sample.acceleration_g.z,
+                         sample.angular_rate_dps.x,
+                         sample.angular_rate_dps.y,
+                         sample.angular_rate_dps.z,
+                         sample.temperature_c);
+            }
         } else {
             ESP_LOGE(APP_TAG, "Failed to read ISM330DLC: %s",
                      esp_err_to_name(err));
+            vTaskDelay(1);
         }
 
-        vTaskDelay(IMU_SAMPLE_PERIOD);
+        /* Give the idle task occasional CPU time without pacing every read. */
+        if ((sample_count % IMU_YIELD_INTERVAL) == 0U) {
+            vTaskDelay(1);
+        }
     }
 }
