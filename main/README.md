@@ -20,6 +20,10 @@ The controller starts disarmed. The browser sends a heartbeat while armed; a
 750 ms command timeout or an IMU read failure disarms the controller and drives
 all motor outputs to minimum.
 
+The Settings → PID tuning submenu exposes the Kp, Ki, and Kd gains for roll
+attitude, pitch attitude, and yaw-rate control. Gains can only be changed while
+disarmed and are persisted in NVS.
+
 The IMU alone provides attitude stabilization, not altitude measurement.
 Maintaining altitude therefore requires manual throttle. True altitude hold
 needs an additional barometer, range sensor, or other vertical-position input.

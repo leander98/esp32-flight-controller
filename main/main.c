@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -33,6 +34,9 @@
 #define ESC_NVS_NAMESPACE  "flight_esc"
 #define ESC_NVS_CONFIG_KEY "channels"
 #define ESC_CONFIG_VERSION 1U
+#define PID_NVS_NAMESPACE  "flight_pid"
+#define PID_NVS_CONFIG_KEY "gains"
+#define PID_CONFIG_VERSION 1U
 
 static const char *APP_TAG = "flight-controller";
 static portMUX_TYPE s_telemetry_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -72,6 +76,34 @@ typedef struct {
         uint16_t calibration_high_time_ms;
     } channel[ESC_COUNT];
 } esc_persistent_config_t;
+
+/** @brief Versioned flight-controller gains stored in NVS. */
+typedef struct {
+    uint8_t version;
+    esp32_wifi_drone_remote_pid_config_t gains;
+} pid_persistent_config_t;
+
+/** @brief Return whether all submitted PID gains are finite and bounded. */
+static bool is_valid_pid_config(
+    const esp32_wifi_drone_remote_pid_config_t *config)
+{
+    if (config == NULL) {
+        return false;
+    }
+    const float values[] = {
+        config->roll_kp, config->roll_ki, config->roll_kd,
+        config->pitch_kp, config->pitch_ki, config->pitch_kd,
+        config->yaw_kp, config->yaw_ki, config->yaw_kd,
+    };
+    for (size_t index = 0; index < sizeof(values) / sizeof(values[0]);
+         ++index) {
+        if (!isfinite(values[index]) ||
+            values[index] < 0.0f || values[index] > 10.0f) {
+            return false;
+        }
+    }
+    return true;
+}
 
 /** @brief Return whether one ESC configuration is safe and supported. */
 static bool is_valid_esc_config(const xw30a_config_t *config)
@@ -119,7 +151,7 @@ static esp_err_t save_esc_configs(void)
             s_esc_configs[index].calibration_high_time_ms;
     }
 
-    nvs_handle_t nvs;
+    nvs_handle_t nvs = 0;
     esp_err_t err = nvs_open(ESC_NVS_NAMESPACE, NVS_READWRITE, &nvs);
     if (err != ESP_OK) {
         return err;
@@ -135,7 +167,7 @@ static esp_err_t save_esc_configs(void)
 /** @brief Restore all valid ESC settings, or retain defaults. */
 static esp_err_t load_esc_configs(void)
 {
-    nvs_handle_t nvs;
+    nvs_handle_t nvs = 0;
     esp_err_t err = nvs_open(ESC_NVS_NAMESPACE, NVS_READONLY, &nvs);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
         return ESP_OK;
@@ -656,6 +688,134 @@ static esp_err_t set_remote_imu_config(
     return err;
 }
 
+/** @brief Copy web-facing gains into the internal controller configuration. */
+static void apply_pid_config(
+    flight_controller_config_t *destination,
+    const esp32_wifi_drone_remote_pid_config_t *source)
+{
+    destination->roll.kp = source->roll_kp;
+    destination->roll.ki = source->roll_ki;
+    destination->roll.kd = source->roll_kd;
+    destination->pitch.kp = source->pitch_kp;
+    destination->pitch.ki = source->pitch_ki;
+    destination->pitch.kd = source->pitch_kd;
+    destination->yaw_rate.kp = source->yaw_kp;
+    destination->yaw_rate.ki = source->yaw_ki;
+    destination->yaw_rate.kd = source->yaw_kd;
+}
+
+/** @brief Convert internal controller gains to their web-facing structure. */
+static esp32_wifi_drone_remote_pid_config_t export_pid_config(
+    const flight_controller_config_t *source)
+{
+    return (esp32_wifi_drone_remote_pid_config_t) {
+        .roll_kp = source->roll.kp,
+        .roll_ki = source->roll.ki,
+        .roll_kd = source->roll.kd,
+        .pitch_kp = source->pitch.kp,
+        .pitch_ki = source->pitch.ki,
+        .pitch_kd = source->pitch.kd,
+        .yaw_kp = source->yaw_rate.kp,
+        .yaw_ki = source->yaw_rate.ki,
+        .yaw_kd = source->yaw_rate.kd,
+    };
+}
+
+/** @brief Restore valid PID gains from NVS into a default configuration. */
+static esp_err_t load_pid_config(flight_controller_config_t *config)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(PID_NVS_NAMESPACE, NVS_READONLY, &nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    pid_persistent_config_t stored = {0};
+    size_t size = sizeof(stored);
+    err = nvs_get_blob(nvs, PID_NVS_CONFIG_KEY, &stored, &size);
+    nvs_close(nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (size != sizeof(stored) || stored.version != PID_CONFIG_VERSION ||
+        !is_valid_pid_config(&stored.gains)) {
+        ESP_LOGW(APP_TAG, "Ignoring invalid persisted PID gains");
+        return ESP_OK;
+    }
+    apply_pid_config(config, &stored.gains);
+    ESP_LOGI(APP_TAG, "Restored persisted flight-controller PID gains");
+    return ESP_OK;
+}
+
+/** @brief Return active flight-controller gains to the settings API. */
+static esp_err_t get_remote_pid_config(
+    esp32_wifi_drone_remote_pid_config_t *config,
+    void *context)
+{
+    (void)context;
+    if (config == NULL || s_flight_mutex == NULL ||
+        xSemaphoreTake(s_flight_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *config = export_pid_config(&s_flight_controller.config);
+    xSemaphoreGive(s_flight_mutex);
+    return ESP_OK;
+}
+
+/** @brief Apply and persist web-submitted PID gains while disarmed. */
+static esp_err_t set_remote_pid_config(
+    const esp32_wifi_drone_remote_pid_config_t *config,
+    void *context)
+{
+    (void)context;
+    if (!is_valid_pid_config(config) || s_flight_mutex == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(s_flight_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (s_flight_controller.armed) {
+        xSemaphoreGive(s_flight_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const flight_controller_config_t previous = s_flight_controller.config;
+    apply_pid_config(&s_flight_controller.config, config);
+    const pid_persistent_config_t stored = {
+        .version = PID_CONFIG_VERSION,
+        .gains = *config,
+    };
+    nvs_handle_t nvs = 0;
+    esp_err_t err = nvs_open(PID_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(nvs, PID_NVS_CONFIG_KEY,
+                           &stored, sizeof(stored));
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    if (err == ESP_OK) {
+        s_flight_controller.roll_integral = 0.0f;
+        s_flight_controller.pitch_integral = 0.0f;
+        s_flight_controller.yaw_integral = 0.0f;
+        s_flight_controller.previous_roll_error = 0.0f;
+        s_flight_controller.previous_pitch_error = 0.0f;
+        s_flight_controller.previous_yaw_error = 0.0f;
+    } else {
+        s_flight_controller.config = previous;
+    }
+    if (nvs != 0) {
+        nvs_close(nvs);
+    }
+    xSemaphoreGive(s_flight_mutex);
+    return err;
+}
+
 static esp_err_t initialize_imu(esp32_ism330dlc_t *imu)
 {
     i2c_master_bus_handle_t bus;
@@ -721,8 +881,13 @@ void app_main(void)
         ESP_LOGE(APP_TAG, "Failed to create sensor/control mutexes");
         return;
     }
-    const flight_controller_config_t flight_config =
+    flight_controller_config_t flight_config =
         FLIGHT_CONTROLLER_DEFAULT_CONFIG();
+    err = load_pid_config(&flight_config);
+    if (err != ESP_OK) {
+        ESP_LOGW(APP_TAG, "Failed to load persisted PID gains: %s",
+                 esp_err_to_name(err));
+    }
     err = flight_controller_init(&s_flight_controller, &flight_config);
     if (err != ESP_OK) {
         ESP_LOGE(APP_TAG, "Flight controller initialization failed: %s",
@@ -748,6 +913,8 @@ void app_main(void)
     remote_config.imu_get_handler = get_remote_imu_config;
     remote_config.imu_set_handler = set_remote_imu_config;
     remote_config.imu_context = &s_imu;
+    remote_config.pid_get_handler = get_remote_pid_config;
+    remote_config.pid_set_handler = set_remote_pid_config;
     remote_config.esc_get_handler = get_remote_esc_config;
     remote_config.esc_set_handler = set_remote_esc_config;
     remote_config.esc_throttle_handler = set_remote_esc_throttle;
