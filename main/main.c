@@ -348,7 +348,9 @@ static esp_err_t set_remote_esc_throttle(
     if (xSemaphoreTake(s_esc_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
-    esp_err_t err = s_esc_handles[index] == NULL
+    esp_err_t err = s_programming_esc_index >= 0
+        ? ESP_ERR_INVALID_STATE
+        : s_esc_handles[index] == NULL
         ? ESP_ERR_INVALID_STATE
         : xw30a_control_set_throttle(s_esc_handles[index], throttle);
     xSemaphoreGive(s_esc_mutex);
@@ -439,6 +441,74 @@ static esp_err_t program_remote_esc(
         default:
             err = ESP_ERR_INVALID_ARG;
             break;
+        }
+    }
+    xSemaphoreGive(s_esc_mutex);
+    return err;
+}
+
+/** @brief Execute the manual's guided throttle-range setting sequence. */
+static esp_err_t set_remote_esc_throttle_range(
+    uint8_t index,
+    esp32_wifi_drone_remote_esc_throttle_range_action_t action,
+    void *context)
+{
+    (void)context;
+    if (index >= ESC_COUNT || s_esc_mutex == NULL ||
+        action > ESP32_WIFI_ESC_THROTTLE_RANGE_CANCEL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (action == ESP32_WIFI_ESC_THROTTLE_RANGE_BEGIN) {
+        if (s_flight_mutex == NULL ||
+            xSemaphoreTake(s_flight_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+            return ESP_ERR_TIMEOUT;
+        }
+        const bool flight_armed = s_flight_controller.armed;
+        xSemaphoreGive(s_flight_mutex);
+        if (flight_armed) {
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+    if (xSemaphoreTake(s_esc_mutex, pdMS_TO_TICKS(3500)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    xw30a_handle_t handle = s_esc_handles[index];
+    if (handle != NULL) {
+        if (action == ESP32_WIFI_ESC_THROTTLE_RANGE_BEGIN) {
+            if (s_programming_esc_index >= 0) {
+                err = ESP_ERR_INVALID_STATE;
+            } else {
+                err = ESP_OK;
+                for (size_t channel = 0; channel < ESC_COUNT; ++channel) {
+                    if (channel != index) {
+                        err = xw30a_control_stop(s_esc_handles[channel]);
+                        if (err != ESP_OK) {
+                            break;
+                        }
+                    }
+                }
+                if (err == ESP_OK) {
+                    err = xw30a_setup_begin_calibration(handle);
+                }
+                if (err == ESP_OK) {
+                    s_programming_esc_index = index;
+                }
+            }
+        } else if (s_programming_esc_index != index) {
+            err = ESP_ERR_INVALID_STATE;
+        } else if (action ==
+                   ESP32_WIFI_ESC_THROTTLE_RANGE_LATCH_MINIMUM) {
+            err = xw30a_setup_finish_calibration(handle);
+            if (err == ESP_OK) {
+                s_programming_esc_index = -1;
+            }
+        } else {
+            err = xw30a_setup_cancel(handle);
+            if (err == ESP_OK) {
+                s_programming_esc_index = -1;
+            }
         }
     }
     xSemaphoreGive(s_esc_mutex);
@@ -934,6 +1004,8 @@ void app_main(void)
     remote_config.esc_set_handler = set_remote_esc_config;
     remote_config.esc_throttle_handler = set_remote_esc_throttle;
     remote_config.esc_program_handler = program_remote_esc;
+    remote_config.esc_throttle_range_handler =
+        set_remote_esc_throttle_range;
     remote_config.api_handler = handle_flight_request;
     err = esp32_wifi_drone_remote_start(&remote_config);
     if (err != ESP_OK) {
