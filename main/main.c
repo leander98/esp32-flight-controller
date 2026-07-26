@@ -39,6 +39,7 @@ static esp32_ism330dlc_t s_imu;
 static SemaphoreHandle_t s_esc_mutex;
 static xw30a_handle_t s_esc_handles[ESC_COUNT];
 static xw30a_config_t s_esc_configs[ESC_COUNT];
+static int s_programming_esc_index = -1;
 
 /** GPIO assignments used when no persisted ESC configuration exists. */
 static const gpio_num_t s_default_esc_gpios[ESC_COUNT] = {
@@ -305,6 +306,85 @@ static esp_err_t set_remote_esc_throttle(
     return err;
 }
 
+/** @brief Dispatch one guided audible-programming operation to an ESC. */
+static esp_err_t program_remote_esc(
+    uint8_t index,
+    esp32_wifi_drone_remote_esc_program_action_t action,
+    uint8_t selection,
+    void *context)
+{
+    (void)context;
+    if (index >= ESC_COUNT || s_esc_mutex == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(s_esc_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    xw30a_handle_t handle = s_esc_handles[index];
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    if (handle != NULL) {
+        if (action == ESP32_WIFI_ESC_PROGRAM_BEGIN &&
+            s_programming_esc_index >= 0) {
+            xSemaphoreGive(s_esc_mutex);
+            return ESP_ERR_INVALID_STATE;
+        }
+        if (action != ESP32_WIFI_ESC_PROGRAM_BEGIN &&
+            s_programming_esc_index != index) {
+            xSemaphoreGive(s_esc_mutex);
+            return ESP_ERR_INVALID_STATE;
+        }
+        switch (action) {
+        case ESP32_WIFI_ESC_PROGRAM_BEGIN:
+            for (size_t channel = 0; channel < ESC_COUNT; ++channel) {
+                err = xw30a_control_stop(s_esc_handles[channel]);
+                if (err != ESP_OK) {
+                    break;
+                }
+            }
+            if (err != ESP_OK) {
+                break;
+            }
+            err = xw30a_setup_begin_programming(handle);
+            if (err == ESP_OK) {
+                s_programming_esc_index = index;
+            }
+            break;
+        case ESP32_WIFI_ESC_PROGRAM_SELECT_ITEM:
+            err = xw30a_setup_select_program_item(
+                handle, (xw30a_program_item_t)selection);
+            if (err == ESP_OK &&
+                selection == XW30A_PROGRAM_ITEM_EXIT) {
+                s_programming_esc_index = -1;
+            }
+            break;
+        case ESP32_WIFI_ESC_PROGRAM_STORE_VALUE:
+            err = xw30a_setup_store_program_value(
+                handle, (xw30a_program_value_t)selection);
+            break;
+        case ESP32_WIFI_ESC_PROGRAM_CONTINUE:
+            err = xw30a_setup_finish_programming_value(handle, true);
+            break;
+        case ESP32_WIFI_ESC_PROGRAM_EXIT:
+            err = xw30a_setup_finish_programming_value(handle, false);
+            if (err == ESP_OK) {
+                s_programming_esc_index = -1;
+            }
+            break;
+        case ESP32_WIFI_ESC_PROGRAM_CANCEL:
+            err = xw30a_setup_cancel(handle);
+            if (err == ESP_OK) {
+                s_programming_esc_index = -1;
+            }
+            break;
+        default:
+            err = ESP_ERR_INVALID_ARG;
+            break;
+        }
+    }
+    xSemaphoreGive(s_esc_mutex);
+    return err;
+}
+
 /** @brief Return whether a persisted ISM330 configuration is supported. */
 static bool is_valid_persistent_imu_config(
     const imu_persistent_config_t *config)
@@ -554,6 +634,7 @@ void app_main(void)
     remote_config.esc_get_handler = get_remote_esc_config;
     remote_config.esc_set_handler = set_remote_esc_config;
     remote_config.esc_throttle_handler = set_remote_esc_throttle;
+    remote_config.esc_program_handler = program_remote_esc;
     err = esp32_wifi_drone_remote_start(&remote_config);
     if (err != ESP_OK) {
         ESP_LOGE(APP_TAG, "Wi-Fi drone remote initialization failed: %s",
