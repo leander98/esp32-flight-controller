@@ -21,9 +21,19 @@ The controller starts disarmed. The browser sends a heartbeat while armed; a
 all motor outputs to minimum.
 
 The Settings → PID tuning submenu exposes the Kp, Ki, and Kd gains for roll
-attitude, pitch attitude, and yaw-rate control. Gains can only be changed while
-disarmed and are persisted in NVS.
+attitude, pitch attitude, yaw-rate, and vertical-velocity control. Gains can
+only be changed while disarmed and are persisted in NVS.
 
-The IMU alone provides attitude stabilization, not altitude measurement.
-Maintaining altitude therefore requires manual throttle. True altitude hold
-needs an additional barometer, range sensor, or other vertical-position input.
+The vertical controller tilt-compensates the accelerometer Z axis, removes
+gravity, and integrates the result with leakage to obtain a rudimentary
+vertical-velocity estimate. Center throttle requests zero vertical velocity;
+positions above and below center request climb and descent. At minimum stick,
+vertical control is disabled but the armed-idle motor floor and attitude
+corrections can remain active. Both the armed-idle output and minimum-throttle
+stabilization are configurable in the PID tuning submenu. Disarming or a
+failsafe always stops all motors.
+
+An accelerometer does not directly measure altitude, and integration drift
+cannot be eliminated this way. This mechanism can only provide short-term
+vertical damping, not reliable altitude hold. Safe altitude hold needs an
+additional barometer, range sensor, or other vertical-position input.

@@ -21,10 +21,16 @@ typedef struct {
     flight_pid_config_t roll;
     flight_pid_config_t pitch;
     flight_pid_config_t yaw_rate;
+    flight_pid_config_t vertical_velocity;
     float complementary_accelerometer_weight;
     float maximum_tilt_degrees;
     float maximum_yaw_rate_dps;
+    float maximum_vertical_speed_mps;
+    float hover_throttle;
+    float armed_idle_throttle;
+    float vertical_velocity_leak_per_second;
     uint32_t command_timeout_us;
+    bool stabilize_at_minimum_throttle;
 } flight_controller_config_t;
 
 typedef struct {
@@ -42,6 +48,7 @@ typedef struct {
 typedef struct {
     float roll_degrees;
     float pitch_degrees;
+    float vertical_velocity_mps;
     float motor[4];
     bool armed;
 } flight_controller_output_t;
@@ -51,12 +58,15 @@ typedef struct {
     flight_movement_command_t command;
     float roll_degrees;
     float pitch_degrees;
+    float vertical_velocity_mps;
     float roll_integral;
     float pitch_integral;
     float yaw_integral;
+    float vertical_velocity_integral;
     float previous_roll_error;
     float previous_pitch_error;
     float previous_yaw_error;
+    float previous_vertical_velocity_error;
     uint64_t last_command_us;
     bool attitude_initialized;
     bool armed;
@@ -66,10 +76,16 @@ typedef struct {
     .roll = { 0.018f, 0.004f, 0.0025f, 20.0f, 0.30f },                    \
     .pitch = { 0.018f, 0.004f, 0.0025f, 20.0f, 0.30f },                   \
     .yaw_rate = { 0.003f, 0.001f, 0.0f, 50.0f, 0.20f },                   \
+    .vertical_velocity = { 0.12f, 0.03f, 0.02f, 2.0f, 0.25f },            \
     .complementary_accelerometer_weight = 0.02f,                           \
     .maximum_tilt_degrees = 20.0f,                                        \
     .maximum_yaw_rate_dps = 120.0f,                                       \
+    .maximum_vertical_speed_mps = 2.0f,                                   \
+    .hover_throttle = 0.5f,                                               \
+    .armed_idle_throttle = 0.06f,                                         \
+    .vertical_velocity_leak_per_second = 0.35f,                            \
     .command_timeout_us = 750000U,                                        \
+    .stabilize_at_minimum_throttle = true,                                \
 }
 
 esp_err_t flight_controller_init(

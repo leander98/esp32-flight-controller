@@ -36,7 +36,7 @@
 #define ESC_CONFIG_VERSION 1U
 #define PID_NVS_NAMESPACE  "flight_pid"
 #define PID_NVS_CONFIG_KEY "gains"
-#define PID_CONFIG_VERSION 1U
+#define PID_CONFIG_VERSION 3U
 
 static const char *APP_TAG = "flight-controller";
 static portMUX_TYPE s_telemetry_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -94,6 +94,7 @@ static bool is_valid_pid_config(
         config->roll_kp, config->roll_ki, config->roll_kd,
         config->pitch_kp, config->pitch_ki, config->pitch_kd,
         config->yaw_kp, config->yaw_ki, config->yaw_kd,
+        config->altitude_kp, config->altitude_ki, config->altitude_kd,
     };
     for (size_t index = 0; index < sizeof(values) / sizeof(values[0]);
          ++index) {
@@ -102,7 +103,9 @@ static bool is_valid_pid_config(
             return false;
         }
     }
-    return true;
+    return isfinite(config->armed_idle_throttle) &&
+           config->armed_idle_throttle >= 0.01f &&
+           config->armed_idle_throttle <= 0.30f;
 }
 
 /** @brief Return whether one ESC configuration is safe and supported. */
@@ -702,6 +705,12 @@ static void apply_pid_config(
     destination->yaw_rate.kp = source->yaw_kp;
     destination->yaw_rate.ki = source->yaw_ki;
     destination->yaw_rate.kd = source->yaw_kd;
+    destination->vertical_velocity.kp = source->altitude_kp;
+    destination->vertical_velocity.ki = source->altitude_ki;
+    destination->vertical_velocity.kd = source->altitude_kd;
+    destination->armed_idle_throttle = source->armed_idle_throttle;
+    destination->stabilize_at_minimum_throttle =
+        source->stabilize_at_minimum_throttle;
 }
 
 /** @brief Convert internal controller gains to their web-facing structure. */
@@ -718,6 +727,12 @@ static esp32_wifi_drone_remote_pid_config_t export_pid_config(
         .yaw_kp = source->yaw_rate.kp,
         .yaw_ki = source->yaw_rate.ki,
         .yaw_kd = source->yaw_rate.kd,
+        .altitude_kp = source->vertical_velocity.kp,
+        .altitude_ki = source->vertical_velocity.ki,
+        .altitude_kd = source->vertical_velocity.kd,
+        .armed_idle_throttle = source->armed_idle_throttle,
+        .stabilize_at_minimum_throttle =
+            source->stabilize_at_minimum_throttle,
     };
 }
 
