@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -6,6 +7,7 @@
 #include <driver/i2c_master.h>
 #include <esp_err.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
@@ -15,6 +17,7 @@
 #include "esp32-ism330dlc.h"
 #include "esp32-esc-xw30a.h"
 #include "esp32-wifi-drone-remote.h"
+#include "flight-controller.h"
 
 #define IMU_I2C_PORT       I2C_NUM_0
 #define IMU_I2C_SDA_GPIO   GPIO_NUM_8
@@ -37,9 +40,12 @@ static esp32_wifi_drone_remote_telemetry_t s_telemetry;
 static SemaphoreHandle_t s_imu_mutex;
 static esp32_ism330dlc_t s_imu;
 static SemaphoreHandle_t s_esc_mutex;
+static SemaphoreHandle_t s_flight_mutex;
 static xw30a_handle_t s_esc_handles[ESC_COUNT];
 static xw30a_config_t s_esc_configs[ESC_COUNT];
 static int s_programming_esc_index = -1;
+static flight_controller_t s_flight_controller;
+static flight_movement_command_t s_movement_command;
 
 /** GPIO assignments used when no persisted ESC configuration exists. */
 static const gpio_num_t s_default_esc_gpios[ESC_COUNT] = {
@@ -293,8 +299,16 @@ static esp_err_t set_remote_esc_throttle(
 {
     (void)context;
     if (index >= ESC_COUNT || throttle < 0.0f || throttle > 1.0f ||
-        s_esc_mutex == NULL) {
+        s_esc_mutex == NULL || s_flight_mutex == NULL) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(s_flight_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    bool flight_armed = s_flight_controller.armed;
+    xSemaphoreGive(s_flight_mutex);
+    if (flight_armed) {
+        return ESP_ERR_INVALID_STATE;
     }
     if (xSemaphoreTake(s_esc_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
@@ -316,6 +330,17 @@ static esp_err_t program_remote_esc(
     (void)context;
     if (index >= ESC_COUNT || s_esc_mutex == NULL) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (action == ESP32_WIFI_ESC_PROGRAM_BEGIN) {
+        if (s_flight_mutex == NULL ||
+            xSemaphoreTake(s_flight_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+            return ESP_ERR_TIMEOUT;
+        }
+        bool flight_armed = s_flight_controller.armed;
+        xSemaphoreGive(s_flight_mutex);
+        if (flight_armed) {
+            return ESP_ERR_INVALID_STATE;
+        }
     }
     if (xSemaphoreTake(s_esc_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
@@ -382,6 +407,88 @@ static esp_err_t program_remote_esc(
         }
     }
     xSemaphoreGive(s_esc_mutex);
+    return err;
+}
+
+/** @brief Clamp a normalized controller value to its supported interval. */
+static float clamp_normalized(float value)
+{
+    if (value < -1.0f) {
+        return -1.0f;
+    }
+    if (value > 1.0f) {
+        return 1.0f;
+    }
+    return value;
+}
+
+/**
+ * @brief Convert browser stick and arming requests into flight setpoints.
+ *
+ * The left stick controls yaw and collective throttle. Its center position is
+ * the configured open-loop hover estimate (50 percent). The right stick
+ * controls desired roll and pitch angles.
+ */
+static esp_err_t handle_flight_request(
+    const char *uri,
+    const uint8_t *body,
+    size_t body_length,
+    void *context)
+{
+    (void)context;
+    if (uri == NULL || body == NULL || body_length >= 96U ||
+        s_flight_mutex == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char json[96];
+    memcpy(json, body, body_length);
+    json[body_length] = '\0';
+    if (xSemaphoreTake(s_flight_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    const uint64_t now_us = (uint64_t)esp_timer_get_time();
+    esp_err_t err = ESP_OK;
+    if (strcmp(uri, "/api/left-stick") == 0) {
+        float x;
+        float y;
+        if (sscanf(json, "{\"x\":%f,\"y\":%f}", &x, &y) != 2) {
+            err = ESP_ERR_INVALID_ARG;
+        } else {
+            s_movement_command.yaw = clamp_normalized(x);
+            s_movement_command.throttle =
+                (clamp_normalized(y) + 1.0f) * 0.5f;
+            err = flight_controller_set_movement(
+                &s_flight_controller, &s_movement_command, now_us);
+        }
+    } else if (strcmp(uri, "/api/right-stick") == 0) {
+        float x;
+        float y;
+        if (sscanf(json, "{\"x\":%f,\"y\":%f}", &x, &y) != 2) {
+            err = ESP_ERR_INVALID_ARG;
+        } else {
+            s_movement_command.roll = clamp_normalized(x);
+            s_movement_command.pitch = clamp_normalized(y);
+            err = flight_controller_set_movement(
+                &s_flight_controller, &s_movement_command, now_us);
+        }
+    } else if (strcmp(uri, "/api/settings") == 0) {
+        if (strstr(json, "\"heartbeat\":true") != NULL) {
+            err = flight_controller_heartbeat(&s_flight_controller, now_us);
+        } else if (strstr(json, "\"armed\":true") != NULL) {
+            err = s_programming_esc_index < 0 &&
+                    s_movement_command.throttle <= 0.05f
+                ? flight_controller_set_armed(
+                    &s_flight_controller, true, now_us)
+                : ESP_ERR_INVALID_STATE;
+        } else if (strstr(json, "\"armed\":false") != NULL) {
+            err = flight_controller_set_armed(
+                &s_flight_controller, false, now_us);
+            memset(&s_movement_command, 0, sizeof(s_movement_command));
+        }
+    }
+    xSemaphoreGive(s_flight_mutex);
     return err;
 }
 
@@ -608,8 +715,18 @@ void app_main(void)
 
     s_imu_mutex = xSemaphoreCreateMutex();
     s_esc_mutex = xSemaphoreCreateMutex();
-    if (s_imu_mutex == NULL || s_esc_mutex == NULL) {
+    s_flight_mutex = xSemaphoreCreateMutex();
+    if (s_imu_mutex == NULL || s_esc_mutex == NULL ||
+        s_flight_mutex == NULL) {
         ESP_LOGE(APP_TAG, "Failed to create sensor/control mutexes");
+        return;
+    }
+    const flight_controller_config_t flight_config =
+        FLIGHT_CONTROLLER_DEFAULT_CONFIG();
+    err = flight_controller_init(&s_flight_controller, &flight_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "Flight controller initialization failed: %s",
+                 esp_err_to_name(err));
         return;
     }
     err = initialize_imu(&s_imu);
@@ -635,6 +752,7 @@ void app_main(void)
     remote_config.esc_set_handler = set_remote_esc_config;
     remote_config.esc_throttle_handler = set_remote_esc_throttle;
     remote_config.esc_program_handler = program_remote_esc;
+    remote_config.api_handler = handle_flight_request;
     err = esp32_wifi_drone_remote_start(&remote_config);
     if (err != ESP_OK) {
         ESP_LOGE(APP_TAG, "Wi-Fi drone remote initialization failed: %s",
@@ -643,6 +761,8 @@ void app_main(void)
     }
 
     uint32_t sample_count = 0;
+    int64_t previous_sample_us = esp_timer_get_time();
+    bool flight_was_armed = false;
 
     while (true) {
         esp32_ism330dlc_sample_t sample;
@@ -653,6 +773,10 @@ void app_main(void)
         err = esp32_ism330dlc_read(&s_imu, &sample);
         xSemaphoreGive(s_imu_mutex);
         if (err == ESP_OK) {
+            const int64_t now_us = esp_timer_get_time();
+            float dt_seconds =
+                (float)(now_us - previous_sample_us) / 1000000.0f;
+            previous_sample_us = now_us;
             portENTER_CRITICAL(&s_telemetry_lock);
             s_telemetry = (esp32_wifi_drone_remote_telemetry_t) {
                 .acceleration_x = sample.acceleration_g.x,
@@ -663,10 +787,62 @@ void app_main(void)
                 .gyroscope_z = sample.angular_rate_dps.z,
             };
             portEXIT_CRITICAL(&s_telemetry_lock);
+
+            const flight_imu_sample_t flight_sample = {
+                .acceleration_g = {
+                    sample.acceleration_g.x,
+                    sample.acceleration_g.y,
+                    sample.acceleration_g.z,
+                },
+                .angular_rate_dps = {
+                    sample.angular_rate_dps.x,
+                    sample.angular_rate_dps.y,
+                    sample.angular_rate_dps.z,
+                },
+            };
+            flight_controller_output_t output;
+            if (dt_seconds > 0.0f && dt_seconds <= 0.1f &&
+                xSemaphoreTake(s_flight_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                err = flight_controller_update(
+                    &s_flight_controller, &flight_sample, dt_seconds,
+                    (uint64_t)now_us, &output);
+                xSemaphoreGive(s_flight_mutex);
+                if (err == ESP_OK &&
+                    (output.armed || flight_was_armed) &&
+                    xSemaphoreTake(s_esc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    for (size_t index = 0; index < ESC_COUNT; ++index) {
+                        esp_err_t motor_err = xw30a_control_set_throttle(
+                            s_esc_handles[index], output.motor[index]);
+                        if (motor_err != ESP_OK) {
+                            ESP_LOGE(APP_TAG, "ESC %u control failed: %s",
+                                     (unsigned)(index + 1U),
+                                     esp_err_to_name(motor_err));
+                        }
+                    }
+                    xSemaphoreGive(s_esc_mutex);
+                }
+                if (err == ESP_OK) {
+                    flight_was_armed = output.armed;
+                }
+            }
             ++sample_count;
         } else {
             ESP_LOGE(APP_TAG, "Failed to read ISM330DLC: %s",
                      esp_err_to_name(err));
+            if (flight_was_armed &&
+                xSemaphoreTake(s_flight_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                flight_controller_set_armed(
+                    &s_flight_controller, false,
+                    (uint64_t)esp_timer_get_time());
+                xSemaphoreGive(s_flight_mutex);
+                if (xSemaphoreTake(s_esc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    for (size_t index = 0; index < ESC_COUNT; ++index) {
+                        (void)xw30a_control_stop(s_esc_handles[index]);
+                    }
+                    xSemaphoreGive(s_esc_mutex);
+                }
+                flight_was_armed = false;
+            }
             vTaskDelay(1);
         }
 
