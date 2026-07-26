@@ -13,7 +13,7 @@
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=/home/leander/dev/esp32/esp32-flight-controller/build"
+    "--compile-commands-dir=${workspaceFolder}/build"
   ],
   "idf.flashType": "JTAG"
 }
