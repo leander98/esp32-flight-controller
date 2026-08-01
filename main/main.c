@@ -986,6 +986,30 @@ static esp_err_t initialize_imu(esp32_ism330dlc_t *imu)
     return err;
 }
 
+/**
+ * @brief Convert the board-mounted sensor axes to the aircraft body frame.
+ *
+ * Body X points forward, body Y points right, and body Z points up. The IMU
+ * is mounted with both horizontal axes reversed, so accelerometer and gyro
+ * axes must receive the same sign correction.
+ */
+static flight_imu_sample_t imu_sample_to_body_frame(
+    const esp32_ism330dlc_sample_t *sample)
+{
+    return (flight_imu_sample_t) {
+        .acceleration_g = {
+            -sample->acceleration_g.x,
+            -sample->acceleration_g.y,
+             sample->acceleration_g.z,
+        },
+        .angular_rate_dps = {
+            -sample->angular_rate_dps.x,
+            -sample->angular_rate_dps.y,
+             sample->angular_rate_dps.z,
+        },
+    };
+}
+
 /** @brief Run stabilization and update PWM on the non-Wi-Fi core. */
 static void flight_control_task(void *context)
 {
@@ -1005,32 +1029,21 @@ static void flight_control_task(void *context)
         xSemaphoreGive(s_imu_mutex);
         if (err == ESP_OK) {
             const int64_t now_us = esp_timer_get_time();
+            const flight_imu_sample_t flight_sample =
+                imu_sample_to_body_frame(&sample);
             float dt_seconds =
                 (float)(now_us - previous_sample_us) / 1000000.0f;
             previous_sample_us = now_us;
             portENTER_CRITICAL(&s_telemetry_lock);
             s_telemetry = (esp32_wifi_drone_remote_telemetry_t) {
-                .acceleration_x = sample.acceleration_g.x,
-                .acceleration_y = sample.acceleration_g.y,
-                .acceleration_z = sample.acceleration_g.z,
-                .gyroscope_x = sample.angular_rate_dps.x,
-                .gyroscope_y = sample.angular_rate_dps.y,
-                .gyroscope_z = sample.angular_rate_dps.z,
+                .acceleration_x = flight_sample.acceleration_g[0],
+                .acceleration_y = flight_sample.acceleration_g[1],
+                .acceleration_z = flight_sample.acceleration_g[2],
+                .gyroscope_x = flight_sample.angular_rate_dps[0],
+                .gyroscope_y = flight_sample.angular_rate_dps[1],
+                .gyroscope_z = flight_sample.angular_rate_dps[2],
             };
             portEXIT_CRITICAL(&s_telemetry_lock);
-
-            const flight_imu_sample_t flight_sample = {
-                .acceleration_g = {
-                    sample.acceleration_g.x,
-                    sample.acceleration_g.y,
-                    sample.acceleration_g.z,
-                },
-                .angular_rate_dps = {
-                    sample.angular_rate_dps.x,
-                    sample.angular_rate_dps.y,
-                    sample.angular_rate_dps.z,
-                },
-            };
             flight_controller_output_t output;
             if (dt_seconds > 0.0f && dt_seconds <= 0.1f &&
                 xSemaphoreTake(s_flight_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {

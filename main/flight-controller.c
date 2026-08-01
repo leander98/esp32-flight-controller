@@ -66,6 +66,44 @@ static void reset_pid(flight_controller_t *controller)
     controller->previous_vertical_velocity_error = 0.0f;
 }
 
+/** @brief Integrate body acceleration into a deliberately leaky climb rate. */
+static float update_vertical_velocity(flight_controller_t *controller,
+                                      float ax, float ay, float az,
+                                      float dt_seconds)
+{
+    const float roll = controller->roll_degrees * DEG_TO_RAD;
+    const float pitch = controller->pitch_degrees * DEG_TO_RAD;
+    const float vertical_specific_force_g =
+        -sinf(pitch) * ax + sinf(roll) * cosf(pitch) * ay +
+        cosf(roll) * cosf(pitch) * az;
+    const float acceleration =
+        (vertical_specific_force_g - 1.0f) * STANDARD_GRAVITY_MPS2;
+    const float leak = clampf(
+        1.0f - controller->config.vertical_velocity_leak_per_second *
+                   dt_seconds,
+        0.0f, 1.0f);
+    controller->vertical_velocity_mps =
+        controller->vertical_velocity_mps * leak + acceleration * dt_seconds;
+    return controller->vertical_velocity_mps;
+}
+
+/**
+ * @brief Mix collective and body corrections into Quad-X motor outputs.
+ *
+ * Order is front-left, front-right, rear-right, rear-left. A positive roll
+ * correction increases the left pair; a positive pitch correction increases
+ * the front pair. These signs oppose positive measured attitude error because
+ * the PID error is desired minus measured.
+ */
+static void mix_quad_x(float throttle, float roll, float pitch, float yaw,
+                       float minimum, flight_controller_output_t *output)
+{
+    output->motor[0] = clampf(throttle + pitch + roll - yaw, minimum, 1.0f);
+    output->motor[1] = clampf(throttle + pitch - roll + yaw, minimum, 1.0f);
+    output->motor[2] = clampf(throttle - pitch - roll - yaw, minimum, 1.0f);
+    output->motor[3] = clampf(throttle - pitch + roll + yaw, minimum, 1.0f);
+}
+
 esp_err_t flight_controller_init(
     flight_controller_t *controller,
     const flight_controller_config_t *config)
@@ -252,22 +290,8 @@ esp_err_t flight_controller_update(
      * attitude. Yaw is irrelevant for the vertical projection. The leaky
      * integrator limits, but cannot eliminate, accelerometer bias drift.
      */
-    const float roll_radians = controller->roll_degrees * DEG_TO_RAD;
-    const float pitch_radians = controller->pitch_degrees * DEG_TO_RAD;
-    const float vertical_specific_force_g =
-        -sinf(pitch_radians) * ax +
-        sinf(roll_radians) * cosf(pitch_radians) * ay +
-        cosf(roll_radians) * cosf(pitch_radians) * az;
-    const float vertical_acceleration_mps2 =
-        (vertical_specific_force_g - 1.0f) * STANDARD_GRAVITY_MPS2;
-    const float leak = clampf(
-        1.0f - controller->config.vertical_velocity_leak_per_second *
-                   dt_seconds,
-        0.0f, 1.0f);
-    controller->vertical_velocity_mps =
-        controller->vertical_velocity_mps * leak +
-        vertical_acceleration_mps2 * dt_seconds;
-    output->vertical_velocity_mps = controller->vertical_velocity_mps;
+    output->vertical_velocity_mps = update_vertical_velocity(
+        controller, ax, ay, az, dt_seconds);
 
     /*
      * At minimum stick, keep only the vertical estimator/controller reset.
@@ -321,18 +345,7 @@ esp_err_t flight_controller_update(
             controller->config.armed_idle_throttle, 1.0f);
     }
 
-    /* Quad-X order: front-left, front-right, rear-right, rear-left. */
-    output->motor[0] = clampf(
-        throttle + pitch_correction + roll_correction - yaw_correction,
-        controller->config.armed_idle_throttle, 1.0f);
-    output->motor[1] = clampf(
-        throttle + pitch_correction - roll_correction + yaw_correction,
-        controller->config.armed_idle_throttle, 1.0f);
-    output->motor[2] = clampf(
-        throttle - pitch_correction - roll_correction - yaw_correction,
-        controller->config.armed_idle_throttle, 1.0f);
-    output->motor[3] = clampf(
-        throttle - pitch_correction + roll_correction + yaw_correction,
-        controller->config.armed_idle_throttle, 1.0f);
+    mix_quad_x(throttle, roll_correction, pitch_correction, yaw_correction,
+               controller->config.armed_idle_throttle, output);
     return ESP_OK;
 }
