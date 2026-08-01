@@ -56,7 +56,7 @@ static flight_movement_command_t s_movement_command;
 
 /** GPIO assignments used when no persisted ESC configuration exists. */
 static const gpio_num_t s_default_esc_gpios[ESC_COUNT] = {
-    GPIO_NUM_4, GPIO_NUM_5, GPIO_NUM_6, GPIO_NUM_7,
+    GPIO_NUM_5, GPIO_NUM_7, GPIO_NUM_6, GPIO_NUM_4,
 };
 
 /** @brief Versioned representation of the ISM330 settings stored in NVS. */
@@ -290,15 +290,21 @@ static esp_err_t set_remote_esc_config(
         .max_pulse_us = config->max_pulse_us,
         .calibration_high_time_ms = config->calibration_high_time_ms,
     };
-    if (!is_valid_esc_config(&replacement) ||
-        xSemaphoreTake(s_esc_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    if (!is_valid_esc_config(&replacement)) {
+        ESP_LOGW(APP_TAG, "Rejected invalid ESC %u configuration (GPIO %u)",
+                 (unsigned)(config->index + 1U), config->signal_gpio);
         return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(s_esc_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
     }
     for (size_t index = 0; index < ESC_COUNT; ++index) {
         if (index != config->index &&
             s_esc_configs[index].signal_gpio == replacement.signal_gpio) {
+            ESP_LOGW(APP_TAG, "GPIO %u is already assigned to ESC %u",
+                     replacement.signal_gpio, (unsigned)(index + 1U));
             xSemaphoreGive(s_esc_mutex);
-            return ESP_ERR_INVALID_ARG;
+            return ESP_ERR_INVALID_STATE;
         }
     }
 

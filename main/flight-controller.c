@@ -148,6 +148,31 @@ esp_err_t flight_controller_update(
     const float ax = sample->acceleration_g[0];
     const float ay = sample->acceleration_g[1];
     const float az = sample->acceleration_g[2];
+    const float acceleration_magnitude = sqrtf(ax * ax + ay * ay + az * az);
+    const float raw_gyro_magnitude = sqrtf(
+        sample->angular_rate_dps[0] * sample->angular_rate_dps[0] +
+        sample->angular_rate_dps[1] * sample->angular_rate_dps[1] +
+        sample->angular_rate_dps[2] * sample->angular_rate_dps[2]);
+    const bool stationary = !controller->armed &&
+        fabsf(acceleration_magnitude - 1.0f) < 0.08f &&
+        raw_gyro_magnitude < 5.0f;
+    if (stationary) {
+        const float bias_weight = controller->gyroscope_bias_initialized
+            ? clampf(dt_seconds / 5.0f, 0.0f, 1.0f)
+            : 1.0f;
+        for (size_t axis = 0; axis < 3U; ++axis) {
+            controller->gyroscope_bias_dps[axis] += bias_weight *
+                (sample->angular_rate_dps[axis] -
+                 controller->gyroscope_bias_dps[axis]);
+        }
+        controller->gyroscope_bias_initialized = true;
+    }
+    const float gyro_x = sample->angular_rate_dps[0] -
+        controller->gyroscope_bias_dps[0];
+    const float gyro_y = sample->angular_rate_dps[1] -
+        controller->gyroscope_bias_dps[1];
+    const float gyro_z = sample->angular_rate_dps[2] -
+        controller->gyroscope_bias_dps[2];
     float accel_roll = atan2f(ay, az) * RAD_TO_DEG;
     float accel_pitch =
         atan2f(-ax, sqrtf(ay * ay + az * az)) * RAD_TO_DEG;
@@ -157,8 +182,6 @@ esp_err_t flight_controller_update(
         controller->pitch_degrees = accel_pitch;
         controller->attitude_initialized = true;
     } else {
-        const float acceleration_magnitude =
-            sqrtf(ax * ax + ay * ay + az * az);
         const float accelerometer_trust = clampf(
             1.0f - fabsf(acceleration_magnitude - 1.0f) / 0.35f,
             0.0f, 1.0f);
@@ -167,10 +190,10 @@ esp_err_t flight_controller_update(
             accelerometer_trust;
         const float predicted_roll = wrap_degrees(
             controller->roll_degrees +
-            sample->angular_rate_dps[0] * dt_seconds);
+            gyro_x * dt_seconds);
         const float predicted_pitch = wrap_degrees(
             controller->pitch_degrees +
-            sample->angular_rate_dps[1] * dt_seconds);
+            gyro_y * dt_seconds);
 
         /*
          * Accelerometer Euler angles have two equivalent representations.
@@ -280,7 +303,7 @@ esp_err_t flight_controller_update(
         dt_seconds);
     const float yaw_correction = pid_step(
         &controller->config.yaw_rate,
-        desired_yaw_rate - sample->angular_rate_dps[2],
+        desired_yaw_rate - gyro_z,
         &controller->yaw_integral, &controller->previous_yaw_error,
         dt_seconds);
     float throttle = controller->config.armed_idle_throttle;

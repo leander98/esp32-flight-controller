@@ -68,7 +68,9 @@ typedef struct {
     float previous_pitch_error;
     float previous_yaw_error;
     float previous_vertical_velocity_error;
+    float gyroscope_bias_dps[3];
     uint64_t last_command_us;
+    bool gyroscope_bias_initialized;
     bool attitude_initialized;
     bool armed;
 } flight_controller_t;
