@@ -10,6 +10,7 @@
 #define RAD_TO_DEG 57.2957795f
 #define DEG_TO_RAD 0.0174532925f
 #define STANDARD_GRAVITY_MPS2 9.80665f
+#define LEVEL_ALIGNMENT_DWELL_SECONDS 3.0f
 
 static float clampf(float value, float minimum, float maximum)
 {
@@ -170,6 +171,24 @@ esp_err_t flight_controller_heartbeat(
     return ESP_OK;
 }
 
+esp_err_t flight_controller_align_level(flight_controller_t *controller)
+{
+    if (controller == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (controller->armed || !controller->attitude_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    controller->level_roll_offset_degrees =
+        controller->last_accelerometer_roll_degrees;
+    controller->level_pitch_offset_degrees =
+        controller->last_accelerometer_pitch_degrees;
+    controller->roll_degrees = 0.0f;
+    controller->pitch_degrees = 0.0f;
+    reset_pid(controller);
+    return ESP_OK;
+}
+
 esp_err_t flight_controller_update(
     flight_controller_t *controller,
     const flight_imu_sample_t *sample,
@@ -191,10 +210,16 @@ esp_err_t flight_controller_update(
         sample->angular_rate_dps[0] * sample->angular_rate_dps[0] +
         sample->angular_rate_dps[1] * sample->angular_rate_dps[1] +
         sample->angular_rate_dps[2] * sample->angular_rate_dps[2]);
-    const bool stationary = !controller->armed &&
-        fabsf(acceleration_magnitude - 1.0f) < 0.08f &&
-        raw_gyro_magnitude < 5.0f;
-    if (stationary) {
+    const bool level_candidate = !controller->armed &&
+        fabsf(ax) < 0.02f && fabsf(ay) < 0.02f &&
+        fabsf(az - 1.0f) < 0.03f && raw_gyro_magnitude < 0.5f;
+    controller->level_candidate_seconds = level_candidate
+        ? fminf(controller->level_candidate_seconds + dt_seconds,
+                LEVEL_ALIGNMENT_DWELL_SECONDS)
+        : 0.0f;
+    const bool settled_level = controller->level_candidate_seconds >=
+        LEVEL_ALIGNMENT_DWELL_SECONDS;
+    if (settled_level) {
         const float bias_weight = controller->gyroscope_bias_initialized
             ? clampf(dt_seconds / 5.0f, 0.0f, 1.0f)
             : 1.0f;
@@ -214,6 +239,19 @@ esp_err_t flight_controller_update(
     float accel_roll = atan2f(ay, az) * RAD_TO_DEG;
     float accel_pitch =
         atan2f(-ax, sqrtf(ay * ay + az * az)) * RAD_TO_DEG;
+    controller->last_accelerometer_roll_degrees = accel_roll;
+    controller->last_accelerometer_pitch_degrees = accel_pitch;
+    if (settled_level) {
+        const float weight = clampf(dt_seconds / 20.0f, 0.0f, 1.0f);
+        controller->level_roll_offset_degrees += weight *
+            (accel_roll - controller->level_roll_offset_degrees);
+        controller->level_pitch_offset_degrees += weight *
+            (accel_pitch - controller->level_pitch_offset_degrees);
+    }
+    accel_roll = wrap_degrees(
+        accel_roll - controller->level_roll_offset_degrees);
+    accel_pitch = wrap_degrees(
+        accel_pitch - controller->level_pitch_offset_degrees);
 
     if (!controller->attitude_initialized) {
         controller->roll_degrees = accel_roll;

@@ -69,6 +69,11 @@ typedef struct {
     float previous_yaw_error;
     float previous_vertical_velocity_error;
     float gyroscope_bias_dps[3];
+    float level_roll_offset_degrees;
+    float level_pitch_offset_degrees;
+    float last_accelerometer_roll_degrees;
+    float last_accelerometer_pitch_degrees;
+    float level_candidate_seconds;
     uint64_t last_command_us;
     bool gyroscope_bias_initialized;
     bool attitude_initialized;
@@ -106,6 +111,9 @@ esp_err_t flight_controller_set_movement(
 
 esp_err_t flight_controller_heartbeat(
     flight_controller_t *controller, uint64_t now_us);
+
+/** Record the current resting attitude as level while disarmed. */
+esp_err_t flight_controller_align_level(flight_controller_t *controller);
 
 esp_err_t flight_controller_update(
     flight_controller_t *controller,

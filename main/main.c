@@ -590,6 +590,8 @@ static esp_err_t handle_flight_request(
     } else if (strcmp(uri, "/api/settings") == 0) {
         if (strstr(json, "\"heartbeat\":true") != NULL) {
             err = flight_controller_heartbeat(&s_flight_controller, now_us);
+        } else if (strstr(json, "\"align_imu\":true") != NULL) {
+            err = flight_controller_align_level(&s_flight_controller);
         } else if (strstr(json, "\"armed\":true") != NULL) {
             err = s_programming_esc_index < 0 &&
                     s_movement_command.throttle <= 0.05f
@@ -990,8 +992,8 @@ static esp_err_t initialize_imu(esp32_ism330dlc_t *imu)
  * @brief Convert the board-mounted sensor axes to the aircraft body frame.
  *
  * Body X points forward, body Y points right, and body Z points up. The IMU
- * is mounted with both horizontal axes reversed, so accelerometer and gyro
- * axes must receive the same sign correction.
+ * is mounted with its X axis reversed, so accelerometer and gyro X values
+ * receive the same sign correction while Y remains native.
  */
 static flight_imu_sample_t imu_sample_to_body_frame(
     const esp32_ism330dlc_sample_t *sample)
@@ -999,12 +1001,12 @@ static flight_imu_sample_t imu_sample_to_body_frame(
     return (flight_imu_sample_t) {
         .acceleration_g = {
             -sample->acceleration_g.x,
-            -sample->acceleration_g.y,
+             sample->acceleration_g.y,
              sample->acceleration_g.z,
         },
         .angular_rate_dps = {
             -sample->angular_rate_dps.x,
-            -sample->angular_rate_dps.y,
+             sample->angular_rate_dps.y,
              sample->angular_rate_dps.z,
         },
     };
