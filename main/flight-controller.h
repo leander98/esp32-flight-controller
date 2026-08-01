@@ -30,6 +30,7 @@ typedef struct {
     float armed_idle_throttle;
     float vertical_velocity_leak_per_second;
     uint32_t command_timeout_us;
+    float timeout_throttle;
     bool stabilize_at_minimum_throttle;
 } flight_controller_config_t;
 
@@ -85,6 +86,7 @@ typedef struct {
     .armed_idle_throttle = 0.06f,                                         \
     .vertical_velocity_leak_per_second = 0.35f,                            \
     .command_timeout_us = 750000U,                                        \
+    .timeout_throttle = 0.06f,                                            \
     .stabilize_at_minimum_throttle = true,                                \
 }
 

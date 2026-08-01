@@ -79,6 +79,8 @@ esp_err_t flight_controller_init(
         config->armed_idle_throttle >= config->hover_throttle ||
         config->vertical_velocity_leak_per_second < 0.0f ||
         config->command_timeout_us == 0U ||
+        config->timeout_throttle < 0.0f ||
+        config->timeout_throttle > 1.0f ||
         config->complementary_accelerometer_weight < 0.0f ||
         config->complementary_accelerometer_weight > 1.0f) {
         return ESP_ERR_INVALID_ARG;
@@ -206,14 +208,12 @@ esp_err_t flight_controller_update(
             weight * wrap_degrees(accel_pitch - predicted_pitch));
     }
 
-    if (controller->armed &&
+    const bool command_timed_out = controller->armed &&
         now_us - controller->last_command_us >
-            controller->config.command_timeout_us) {
-        controller->armed = false;
-        controller->command.throttle = 0.0f;
-        controller->vertical_velocity_mps = 0.0f;
-        reset_pid(controller);
-    }
+            controller->config.command_timeout_us;
+    const float command_throttle = command_timed_out
+        ? controller->config.timeout_throttle
+        : controller->command.throttle;
 
     memset(output, 0, sizeof(*output));
     output->roll_degrees = controller->roll_degrees;
@@ -249,9 +249,9 @@ esp_err_t flight_controller_update(
     /*
      * At minimum stick, keep only the vertical estimator/controller reset.
      * Attitude control remains active at armed idle so the motors can react to
-     * a tilted body. Explicit disarm and failsafe paths still output zero.
+     * a tilted body. Explicit disarm still outputs zero.
      */
-    const bool throttle_low = controller->command.throttle <= 0.05f;
+    const bool throttle_low = command_throttle <= 0.05f;
     if (throttle_low) {
         controller->vertical_velocity_mps = 0.0f;
         controller->vertical_velocity_integral = 0.0f;
@@ -286,7 +286,7 @@ esp_err_t flight_controller_update(
     float throttle = controller->config.armed_idle_throttle;
     if (!throttle_low) {
         const float desired_vertical_velocity =
-            (controller->command.throttle - 0.5f) * 2.0f *
+            (command_throttle - 0.5f) * 2.0f *
             controller->config.maximum_vertical_speed_mps;
         const float vertical_correction = pid_step(
             &controller->config.vertical_velocity,

@@ -1,0 +1,19 @@
+menu "Flight controller configuration"
+
+    config FLIGHT_IMU_INIT_ATTEMPTS
+        int "Maximum IMU initialization attempts"
+        range 1 1000
+        default 10
+        help
+            Number of times startup tries to identify and initialize the
+            ISM330DLC before reporting initialization failure.
+
+    config FLIGHT_IMU_RETRY_DELAY_MS
+        int "Delay between IMU initialization attempts (ms)"
+        range 1 60000
+        default 250
+        help
+            Delay between failed ISM330DLC identification or initialization
+            attempts.
+
+endmenu

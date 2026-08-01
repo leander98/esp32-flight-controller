@@ -21,8 +21,8 @@
 #include "flight-controller.h"
 
 #define IMU_I2C_PORT       I2C_NUM_0
-#define IMU_I2C_SDA_GPIO   GPIO_NUM_8
-#define IMU_I2C_SCL_GPIO   GPIO_NUM_9
+#define IMU_I2C_SDA_GPIO   GPIO_NUM_9
+#define IMU_I2C_SCL_GPIO   GPIO_NUM_8
 #define IMU_I2C_FREQUENCY  400000U
 #define IMU_I2C_ADDRESS    0x6AU
 #define IMU_LOG_INTERVAL   256U
@@ -37,6 +37,9 @@
 #define PID_NVS_NAMESPACE  "flight_pid"
 #define PID_NVS_CONFIG_KEY "gains"
 #define PID_CONFIG_VERSION 3U
+#define CONTROL_CORE        1
+#define CONTROL_TASK_STACK  6144U
+#define CONTROL_TASK_PRIORITY 10U
 
 static const char *APP_TAG = "flight-controller";
 static portMUX_TYPE s_telemetry_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -837,6 +840,26 @@ static esp_err_t load_pid_config(flight_controller_config_t *config)
     return ESP_OK;
 }
 
+/** @brief Load control-timeout settings saved by the Wi-Fi AP page. */
+static void load_timeout_config(flight_controller_config_t *config)
+{
+    nvs_handle_t nvs = 0;
+    if (nvs_open("drone_remote", NVS_READONLY, &nvs) != ESP_OK) {
+        return;
+    }
+    uint32_t timeout_ms;
+    uint16_t throttle_permille;
+    if (nvs_get_u32(nvs, "ctrl_timeout", &timeout_ms) == ESP_OK &&
+        timeout_ms > 0U) {
+        config->command_timeout_us = timeout_ms * 1000U;
+    }
+    if (nvs_get_u16(nvs, "timeout_thr", &throttle_permille) == ESP_OK &&
+        throttle_permille <= 1000U) {
+        config->timeout_throttle = (float)throttle_permille / 1000.0f;
+    }
+    nvs_close(nvs);
+}
+
 /** @brief Return active flight-controller gains to the settings API. */
 static esp_err_t get_remote_pid_config(
     esp32_wifi_drone_remote_pid_config_t *config,
@@ -941,79 +964,27 @@ static esp_err_t initialize_imu(esp32_ism330dlc_t *imu)
         ESP_LOGW(APP_TAG, "Failed to load persisted ISM330 configuration: %s",
                  esp_err_to_name(err));
     }
-    return esp32_ism330dlc_init(imu);
+    for (unsigned int attempt = 1;
+         attempt <= CONFIG_FLIGHT_IMU_INIT_ATTEMPTS; ++attempt) {
+        err = esp32_ism330dlc_init(imu);
+        if (err == ESP_OK) {
+            return ESP_OK;
+        }
+        ESP_LOGW(APP_TAG, "ISM330DLC initialization attempt %u/%u failed: %s",
+                 attempt, CONFIG_FLIGHT_IMU_INIT_ATTEMPTS,
+                 esp_err_to_name(err));
+        if (attempt < CONFIG_FLIGHT_IMU_INIT_ATTEMPTS) {
+            vTaskDelay(pdMS_TO_TICKS(CONFIG_FLIGHT_IMU_RETRY_DELAY_MS));
+        }
+    }
+    return err;
 }
 
-void app_main(void)
+/** @brief Run stabilization and update PWM on the non-Wi-Fi core. */
+static void flight_control_task(void *context)
 {
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
-        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    if (err != ESP_OK) {
-        ESP_LOGE(APP_TAG, "NVS initialization failed: %s",
-                 esp_err_to_name(err));
-        return;
-    }
-
-    s_imu_mutex = xSemaphoreCreateMutex();
-    s_esc_mutex = xSemaphoreCreateMutex();
-    s_flight_mutex = xSemaphoreCreateMutex();
-    if (s_imu_mutex == NULL || s_esc_mutex == NULL ||
-        s_flight_mutex == NULL) {
-        ESP_LOGE(APP_TAG, "Failed to create sensor/control mutexes");
-        return;
-    }
-    flight_controller_config_t flight_config =
-        FLIGHT_CONTROLLER_DEFAULT_CONFIG();
-    err = load_pid_config(&flight_config);
-    if (err != ESP_OK) {
-        ESP_LOGW(APP_TAG, "Failed to load persisted PID gains: %s",
-                 esp_err_to_name(err));
-    }
-    err = flight_controller_init(&s_flight_controller, &flight_config);
-    if (err != ESP_OK) {
-        ESP_LOGE(APP_TAG, "Flight controller initialization failed: %s",
-                 esp_err_to_name(err));
-        return;
-    }
-    err = initialize_imu(&s_imu);
-    if (err != ESP_OK) {
-        ESP_LOGE(APP_TAG, "ISM330DLC initialization failed: %s",
-                 esp_err_to_name(err));
-        return;
-    }
-    err = initialize_escs();
-    if (err != ESP_OK) {
-        ESP_LOGE(APP_TAG, "XW30A initialization failed: %s",
-                 esp_err_to_name(err));
-        return;
-    }
-
-    esp32_wifi_drone_remote_config_t remote_config =
-        ESP32_WIFI_DRONE_REMOTE_DEFAULT_CONFIG();
-    remote_config.telemetry_handler = provide_remote_telemetry;
-    remote_config.imu_get_handler = get_remote_imu_config;
-    remote_config.imu_set_handler = set_remote_imu_config;
-    remote_config.imu_context = &s_imu;
-    remote_config.pid_get_handler = get_remote_pid_config;
-    remote_config.pid_set_handler = set_remote_pid_config;
-    remote_config.esc_get_handler = get_remote_esc_config;
-    remote_config.esc_set_handler = set_remote_esc_config;
-    remote_config.esc_throttle_handler = set_remote_esc_throttle;
-    remote_config.esc_program_handler = program_remote_esc;
-    remote_config.esc_throttle_range_handler =
-        set_remote_esc_throttle_range;
-    remote_config.api_handler = handle_flight_request;
-    err = esp32_wifi_drone_remote_start(&remote_config);
-    if (err != ESP_OK) {
-        ESP_LOGE(APP_TAG, "Wi-Fi drone remote initialization failed: %s",
-                 esp_err_to_name(err));
-        return;
-    }
-
+    (void)context;
+    esp_err_t err;
     uint32_t sample_count = 0;
     int64_t previous_sample_us = esp_timer_get_time();
     bool flight_was_armed = false;
@@ -1081,28 +1052,94 @@ void app_main(void)
             }
             ++sample_count;
         } else {
+            /* Retain armed state and the most recent PWM output. */
             ESP_LOGE(APP_TAG, "Failed to read ISM330DLC: %s",
                      esp_err_to_name(err));
-            if (flight_was_armed &&
-                xSemaphoreTake(s_flight_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                flight_controller_set_armed(
-                    &s_flight_controller, false,
-                    (uint64_t)esp_timer_get_time());
-                xSemaphoreGive(s_flight_mutex);
-                if (xSemaphoreTake(s_esc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    for (size_t index = 0; index < ESC_COUNT; ++index) {
-                        (void)xw30a_control_stop(s_esc_handles[index]);
-                    }
-                    xSemaphoreGive(s_esc_mutex);
-                }
-                flight_was_armed = false;
-            }
             vTaskDelay(1);
         }
 
-        /* Give the idle task occasional CPU time without pacing every read. */
         if ((sample_count % IMU_YIELD_INTERVAL) == 0U) {
             vTaskDelay(1);
         }
+    }
+}
+
+void app_main(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "NVS initialization failed: %s",
+                 esp_err_to_name(err));
+        return;
+    }
+
+    s_imu_mutex = xSemaphoreCreateMutex();
+    s_esc_mutex = xSemaphoreCreateMutex();
+    s_flight_mutex = xSemaphoreCreateMutex();
+    if (s_imu_mutex == NULL || s_esc_mutex == NULL ||
+        s_flight_mutex == NULL) {
+        ESP_LOGE(APP_TAG, "Failed to create sensor/control mutexes");
+        return;
+    }
+    flight_controller_config_t flight_config =
+        FLIGHT_CONTROLLER_DEFAULT_CONFIG();
+    load_timeout_config(&flight_config);
+    err = load_pid_config(&flight_config);
+    if (err != ESP_OK) {
+        ESP_LOGW(APP_TAG, "Failed to load persisted PID gains: %s",
+                 esp_err_to_name(err));
+    }
+    err = flight_controller_init(&s_flight_controller, &flight_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "Flight controller initialization failed: %s",
+                 esp_err_to_name(err));
+        return;
+    }
+    err = initialize_imu(&s_imu);
+    if (err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "ISM330DLC initialization failed: %s",
+                 esp_err_to_name(err));
+        return;
+    }
+    err = initialize_escs();
+    if (err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "XW30A initialization failed: %s",
+                 esp_err_to_name(err));
+        return;
+    }
+
+    esp32_wifi_drone_remote_config_t remote_config =
+        ESP32_WIFI_DRONE_REMOTE_DEFAULT_CONFIG();
+    remote_config.telemetry_handler = provide_remote_telemetry;
+    remote_config.imu_get_handler = get_remote_imu_config;
+    remote_config.imu_set_handler = set_remote_imu_config;
+    remote_config.imu_context = &s_imu;
+    remote_config.pid_get_handler = get_remote_pid_config;
+    remote_config.pid_set_handler = set_remote_pid_config;
+    remote_config.esc_get_handler = get_remote_esc_config;
+    remote_config.esc_set_handler = set_remote_esc_config;
+    remote_config.esc_throttle_handler = set_remote_esc_throttle;
+    remote_config.esc_program_handler = program_remote_esc;
+    remote_config.esc_throttle_range_handler =
+        set_remote_esc_throttle_range;
+    remote_config.api_handler = handle_flight_request;
+    err = esp32_wifi_drone_remote_start(&remote_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "Wi-Fi drone remote initialization failed: %s",
+                 esp_err_to_name(err));
+        return;
+    }
+
+    if (xTaskCreatePinnedToCore(flight_control_task, "flight-control",
+                                CONTROL_TASK_STACK, NULL,
+                                CONTROL_TASK_PRIORITY, NULL,
+                                CONTROL_CORE) != pdPASS) {
+        ESP_LOGE(APP_TAG, "Failed to create core-%d flight-control task",
+                 CONTROL_CORE);
     }
 }
