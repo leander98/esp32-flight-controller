@@ -97,24 +97,29 @@ typedef struct {
     .stabilize_at_minimum_throttle = true,                                \
 }
 
+/** @brief Initialize a flight-controller instance with validated settings. */
 esp_err_t flight_controller_init(
     flight_controller_t *controller,
     const flight_controller_config_t *config);
 
+/** @brief Change motor arming state and reset control state when disarming. */
 esp_err_t flight_controller_set_armed(
     flight_controller_t *controller, bool armed, uint64_t now_us);
 
+/** @brief Apply a normalized pilot command and refresh its timestamp. */
 esp_err_t flight_controller_set_movement(
     flight_controller_t *controller,
     const flight_movement_command_t *command,
     uint64_t now_us);
 
+/** @brief Refresh the command timestamp without changing pilot inputs. */
 esp_err_t flight_controller_heartbeat(
     flight_controller_t *controller, uint64_t now_us);
 
 /** Record the current resting attitude as level while disarmed. */
 esp_err_t flight_controller_align_level(flight_controller_t *controller);
 
+/** @brief Process one IMU sample and calculate all four motor outputs. */
 esp_err_t flight_controller_update(
     flight_controller_t *controller,
     const flight_imu_sample_t *sample,

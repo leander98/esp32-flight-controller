@@ -1,3 +1,8 @@
+/**
+ * @file main.c
+ * @brief ESP32-S3 flight-controller application wiring IMU, control, ESCs,
+ *        persistent settings, and the Wi-Fi remote together.
+ */
 #include <stdbool.h>
 #include <math.h>
 #include <stdio.h>
@@ -41,17 +46,29 @@
 #define CONTROL_TASK_STACK  6144U
 #define CONTROL_TASK_PRIORITY 10U
 
+/** Logging tag used by the flight-controller application. */
 static const char *APP_TAG = "flight-controller";
+/** Spinlock protecting the telemetry snapshot shared with the HTTP task. */
 static portMUX_TYPE s_telemetry_lock = portMUX_INITIALIZER_UNLOCKED;
+/** Most recent body-frame IMU and filtered-attitude telemetry. */
 static esp32_wifi_drone_remote_telemetry_t s_telemetry;
+/** Serializes access to the shared IMU driver instance. */
 static SemaphoreHandle_t s_imu_mutex;
+/** Active ISM330DLC driver instance. */
 static esp32_ism330dlc_t s_imu;
+/** Serializes ESC reconfiguration and real-time PWM updates. */
 static SemaphoreHandle_t s_esc_mutex;
+/** Serializes flight-controller commands, settings, and updates. */
 static SemaphoreHandle_t s_flight_mutex;
+/** Runtime handles for the four ESC PWM channels. */
 static xw30a_handle_t s_esc_handles[ESC_COUNT];
+/** Active hardware configuration for each ESC PWM channel. */
 static xw30a_config_t s_esc_configs[ESC_COUNT];
+/** ESC selected by the guided programming sequence, or -1 when idle. */
 static int s_programming_esc_index = -1;
+/** Shared attitude estimator and stabilization controller state. */
 static flight_controller_t s_flight_controller;
+/** Latest normalized command received from both browser sticks. */
 static flight_movement_command_t s_movement_command;
 
 /** GPIO assignments used when no persisted ESC configuration exists. */
@@ -932,6 +949,17 @@ static esp_err_t set_remote_pid_config(
     return err;
 }
 
+/**
+ * @brief Initialize the I2C bus and configure the ISM330DLC.
+ *
+ * The sensor identity/configuration sequence is retried according to the
+ * project Kconfig settings. A failed identity check does not terminate the
+ * application until the configured attempt count has been exhausted.
+ *
+ * @param[out] imu Driver instance populated with bus, device, and settings.
+ * @return ESP_OK when the sensor is ready, otherwise the final I2C or driver
+ *         error returned by the initialization attempts.
+ */
 static esp_err_t initialize_imu(esp32_ism330dlc_t *imu)
 {
     i2c_master_bus_handle_t bus;
@@ -1090,6 +1118,12 @@ static void flight_control_task(void *context)
     }
 }
 
+/**
+ * @brief Initialize persistent state, peripherals, control task, and Wi-Fi UI.
+ *
+ * This is the ESP-IDF application entry point. Initialization failures are
+ * logged and prevent dependent subsystems from being started.
+ */
 void app_main(void)
 {
     esp_err_t err = nvs_flash_init();

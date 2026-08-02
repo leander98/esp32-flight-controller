@@ -12,6 +12,13 @@
 #define STANDARD_GRAVITY_MPS2 9.80665f
 #define LEVEL_ALIGNMENT_DWELL_SECONDS 3.0f
 
+/**
+ * @brief Clamp a floating-point value to an inclusive interval.
+ * @param value Value to constrain.
+ * @param minimum Lowest permitted result.
+ * @param maximum Highest permitted result.
+ * @return The constrained value.
+ */
 static float clampf(float value, float minimum, float maximum)
 {
     return fminf(maximum, fmaxf(minimum, value));
@@ -29,6 +36,15 @@ static float wrap_degrees(float angle)
     return angle;
 }
 
+/**
+ * @brief Advance one PID controller with integral anti-windup.
+ * @param config Gains and controller limits.
+ * @param error Current setpoint error.
+ * @param integral Persistent integral accumulator.
+ * @param previous_error Persistent error from the preceding update.
+ * @param dt Elapsed time in seconds.
+ * @return Bounded controller correction.
+ */
 static float pid_step(const flight_pid_config_t *config, float error,
                       float *integral, float *previous_error, float dt)
 {
@@ -55,6 +71,7 @@ static float pid_step(const flight_pid_config_t *config, float error,
                   -config->output_limit, config->output_limit);
 }
 
+/** @brief Clear all persistent PID accumulator and derivative state. */
 static void reset_pid(flight_controller_t *controller)
 {
     controller->roll_integral = 0.0f;
@@ -105,6 +122,7 @@ static void mix_quad_x(float throttle, float roll, float pitch, float yaw,
     output->motor[3] = clampf(throttle - pitch + roll + yaw, minimum, 1.0f);
 }
 
+/** @copydoc flight_controller_init() */
 esp_err_t flight_controller_init(
     flight_controller_t *controller,
     const flight_controller_config_t *config)
@@ -129,6 +147,7 @@ esp_err_t flight_controller_init(
     return ESP_OK;
 }
 
+/** @copydoc flight_controller_set_armed() */
 esp_err_t flight_controller_set_armed(
     flight_controller_t *controller, bool armed, uint64_t now_us)
 {
@@ -145,6 +164,7 @@ esp_err_t flight_controller_set_armed(
     return ESP_OK;
 }
 
+/** @copydoc flight_controller_set_movement() */
 esp_err_t flight_controller_set_movement(
     flight_controller_t *controller,
     const flight_movement_command_t *command,
@@ -161,6 +181,7 @@ esp_err_t flight_controller_set_movement(
     return ESP_OK;
 }
 
+/** @copydoc flight_controller_heartbeat() */
 esp_err_t flight_controller_heartbeat(
     flight_controller_t *controller, uint64_t now_us)
 {
@@ -171,6 +192,7 @@ esp_err_t flight_controller_heartbeat(
     return ESP_OK;
 }
 
+/** @copydoc flight_controller_align_level() */
 esp_err_t flight_controller_align_level(flight_controller_t *controller)
 {
     if (controller == NULL) {
@@ -189,6 +211,7 @@ esp_err_t flight_controller_align_level(flight_controller_t *controller)
     return ESP_OK;
 }
 
+/** @copydoc flight_controller_update() */
 esp_err_t flight_controller_update(
     flight_controller_t *controller,
     const flight_imu_sample_t *sample,
