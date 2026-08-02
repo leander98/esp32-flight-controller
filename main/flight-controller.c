@@ -11,6 +11,10 @@
 #define DEG_TO_RAD 0.0174532925f
 #define STANDARD_GRAVITY_MPS2 9.80665f
 #define LEVEL_ALIGNMENT_DWELL_SECONDS 3.0f
+/** Stick position at which maximum-throttle output takes priority. */
+#define FULL_THROTTLE_THRESHOLD 0.99f
+/** Maximum normalized motor-to-motor spread at full throttle. */
+#define FULL_THROTTLE_CONTROL_MARGIN 0.03f
 
 /**
  * @brief Clamp a floating-point value to an inclusive interval.
@@ -112,14 +116,54 @@ static float update_vertical_velocity(flight_controller_t *controller,
  * correction increases the left pair; a positive pitch correction increases
  * the front pair. These signs oppose positive measured attitude error because
  * the PID error is desired minus measured.
+ *
+ * @param throttle Normalized collective motor command.
+ * @param roll Roll-axis PID correction.
+ * @param pitch Pitch-axis PID correction.
+ * @param yaw Yaw-rate PID correction.
+ * @param minimum Lowest permitted normalized motor output.
+ * @param full_throttle Whether to anchor output at maximum and limit the
+ *        correction spread to @ref FULL_THROTTLE_CONTROL_MARGIN.
+ * @param[out] output Flight-controller output receiving all motor commands.
  */
 static void mix_quad_x(float throttle, float roll, float pitch, float yaw,
-                       float minimum, flight_controller_output_t *output)
+                       float minimum, bool full_throttle,
+                       flight_controller_output_t *output)
 {
-    output->motor[0] = clampf(throttle + pitch + roll - yaw, minimum, 1.0f);
-    output->motor[1] = clampf(throttle + pitch - roll + yaw, minimum, 1.0f);
-    output->motor[2] = clampf(throttle - pitch - roll - yaw, minimum, 1.0f);
-    output->motor[3] = clampf(throttle - pitch + roll + yaw, minimum, 1.0f);
+    float correction[4] = {
+        pitch + roll - yaw,
+        pitch - roll + yaw,
+        -pitch - roll - yaw,
+        -pitch + roll + yaw,
+    };
+
+    if (full_throttle) {
+        float lowest = correction[0];
+        float highest = correction[0];
+        for (size_t index = 1U; index < 4U; ++index) {
+            lowest = fminf(lowest, correction[index]);
+            highest = fmaxf(highest, correction[index]);
+        }
+        const float spread = highest - lowest;
+        const float scale = spread > FULL_THROTTLE_CONTROL_MARGIN
+            ? FULL_THROTTLE_CONTROL_MARGIN / spread : 1.0f;
+
+        /*
+         * Anchor the strongest requested motor at maximum. Other motors may
+         * be reduced only within the small correction band. With the default
+         * 1000-2000 us ESC range, 3% corresponds to at most 30 us.
+         */
+        for (size_t index = 0U; index < 4U; ++index) {
+            output->motor[index] =
+                1.0f - (highest - correction[index]) * scale;
+        }
+        return;
+    }
+
+    for (size_t index = 0U; index < 4U; ++index) {
+        output->motor[index] = clampf(
+            throttle + correction[index], minimum, 1.0f);
+    }
 }
 
 /** @copydoc flight_controller_init() */
@@ -406,7 +450,12 @@ esp_err_t flight_controller_update(
             controller->config.armed_idle_throttle, 1.0f);
     }
 
+    const bool full_throttle = command_throttle >= FULL_THROTTLE_THRESHOLD;
+    if (full_throttle) {
+        throttle = 1.0f;
+    }
     mix_quad_x(throttle, roll_correction, pitch_correction, yaw_correction,
-               controller->config.armed_idle_throttle, output);
+               controller->config.armed_idle_throttle, full_throttle,
+               output);
     return ESP_OK;
 }
