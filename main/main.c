@@ -1036,8 +1036,7 @@ static void flight_control_task(void *context)
             float dt_seconds =
                 (float)(now_us - previous_sample_us) / 1000000.0f;
             previous_sample_us = now_us;
-            portENTER_CRITICAL(&s_telemetry_lock);
-            s_telemetry = (esp32_wifi_drone_remote_telemetry_t) {
+            esp32_wifi_drone_remote_telemetry_t telemetry = {
                 .acceleration_x = flight_sample.acceleration_g[0],
                 .acceleration_y = flight_sample.acceleration_g[1],
                 .acceleration_z = flight_sample.acceleration_g[2],
@@ -1045,7 +1044,6 @@ static void flight_control_task(void *context)
                 .gyroscope_y = flight_sample.angular_rate_dps[1],
                 .gyroscope_z = flight_sample.angular_rate_dps[2],
             };
-            portEXIT_CRITICAL(&s_telemetry_lock);
             flight_controller_output_t output;
             if (dt_seconds > 0.0f && dt_seconds <= 0.1f &&
                 xSemaphoreTake(s_flight_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -1053,6 +1051,10 @@ static void flight_control_task(void *context)
                     &s_flight_controller, &flight_sample, dt_seconds,
                     (uint64_t)now_us, &output);
                 xSemaphoreGive(s_flight_mutex);
+                if (err == ESP_OK) {
+                    telemetry.roll_degrees = output.roll_degrees;
+                    telemetry.pitch_degrees = output.pitch_degrees;
+                }
                 if (err == ESP_OK &&
                     (output.armed || flight_was_armed) &&
                     xSemaphoreTake(s_esc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -1071,6 +1073,9 @@ static void flight_control_task(void *context)
                     flight_was_armed = output.armed;
                 }
             }
+            portENTER_CRITICAL(&s_telemetry_lock);
+            s_telemetry = telemetry;
+            portEXIT_CRITICAL(&s_telemetry_lock);
             ++sample_count;
         } else {
             /* Retain armed state and the most recent PWM output. */
